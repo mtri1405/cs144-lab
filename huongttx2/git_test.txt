@@ -1,0 +1,25 @@
+ def delete_coredump_file(self, host="",
+                             core_type="core*",
+                             router_name="delete_file",
+                             delete_file="True"):
+        Connect().open_and_login(router_name=router_name, router_host=host)
+        result = Connect().execute_command(router_name=router_name,
+                                  command="cat /etc/init.d/S91coredump",
+                                  prompt="___________sksks")
+
+        list_line = str(result).splitlines()
+        for line in list_line:
+            if "core_pattern" in line:
+                line_core = line
+                if debug:
+                    print line_core
+        if delete_file != "True":
+            return line_core[line_core.find("/"):line_core.find("core")]
+        else:
+            delete_dir = "rm -f " + line_core[line_core.find("/"):line_core.find("core")]+core_type
+
+            Connect().execute_command(router_name=router_name,
+                                      command="su")
+            Connect().execute_command(router_name=router_name,
+                                      command=delete_dir)
+            Connect().close_connection(router_name)
