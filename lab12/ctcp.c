@@ -1,7 +1,7 @@
 /******************************************************************************
  * ctcp.c
  * ------
- * cTCP Lab 1: stop-and-wait.
+ * cTCP Lab 2: sliding window.
  *   - Tối đa 1 segment (data hoặc FIN) chưa được ACK tại một thời điểm.
  *   - Retransmit sau rt_timeout, tối đa 5 lần truyền lại (tổng 6 lần gửi),
  *     quá số đó thì xem như đối phương không phản hồi và đóng kết nối.
@@ -18,6 +18,18 @@
 #define SEGMENT_HDR_SIZE sizeof(ctcp_segment_t)
 #define MAX_RETRANSMIT 5
 
+typedef struct send_segment {
+  ctcp_segment_t *segment;  // Segment ở network order
+  size_t len;               // Header + Payload
+
+  uint32_t start_seq;       // sequence number đầu tiên
+  uint32_t end_seq;         // sequence number kết thúc
+
+  long sent_time;           // Thời gian bắt đầu gửi
+  int rext_count;           // Số lần thực hiện gửi lại
+} send_segment_t;
+
+
 struct ctcp_state
 {
   struct ctcp_state *next;  /* Next in linked list */
@@ -30,11 +42,8 @@ struct ctcp_state
   uint32_t ackno;    /* Seqno của byte kế tiếp mong đợi nhận */
 
   /* Segment đang chờ ACK (stop-and-wait: tối đa 1). Lưu ở network order. */
-  ctcp_segment_t *unacked;
-  size_t unacked_len;
-  uint32_t unacked_end;  /* ackno cần nhận được để coi là đã ACK */
-  long sent_time;        /* Lần gửi gần nhất (ms) */
-  int retx_count;        /* Số lần đã truyền lại */
+  uint32_t send_base;
+  linked_list_t *send_queue;
 
   /* Dữ liệu đã nhận hợp lệ nhưng chưa output hết ra STDOUT */
   char pending[MAX_SEG_DATA_SIZE];
@@ -92,17 +101,18 @@ static int _is_segment_valid(ctcp_segment_t *segment, size_t len)
   return 0;
 }
 
-/**
- * Tạo và gửi segment. Segment mang data hoặc FIN được lưu lại để chờ ACK
- * (và retransmit); ACK thuần thì gửi rồi bỏ.
- * flags ở host order.
- */
-static int _segment_send(ctcp_state_t *state, uint32_t flags, const void *data, size_t len)
+// Tạo segment, chưa gửi
+static ctcp_segment_t *_segment_create(ctcp_state_t *state, uint32_t flags, const void *data, size_t len)
 {
+  if (len > MAX_SEG_DATA_SIZE) {
+    return NULL;
+  }
   size_t seg_len = SEGMENT_HDR_SIZE + len;
   ctcp_segment_t *seg = calloc(1, seg_len);
-  if (seg == NULL)
-    return -1;
+  if (seg == NULL){
+    perr("Cant create segment");
+    return NULL;
+  }
 
   seg->seqno = state->seqno;
   seg->ackno = state->ackno;
@@ -112,27 +122,54 @@ static int _segment_send(ctcp_state_t *state, uint32_t flags, const void *data, 
   if (len > 0 && data != NULL)
     memcpy(seg->data, data, len);
 
-  uint32_t consumed = (uint32_t)len + ((flags & FIN) ? 1 : 0);
-
   _segment_hton(seg);
   seg->cksum = 0;
   seg->cksum = cksum(seg, (uint16_t)seg_len);
 
-  int r = conn_send(state->conn, seg, seg_len);
+  return seg;
+}
 
-  if (consumed > 0)
-  {
-    /* Giữ lại để chờ ACK. Nếu gửi lỗi thì timer sẽ gửi lại. */
-    state->unacked = seg;
-    state->unacked_len = seg_len;
-    state->unacked_end = state->seqno + consumed;
-    state->seqno += consumed;
-    state->sent_time = current_time();
-    state->retx_count = 0;
-    return 0;
+/**
+ * Gửi segment. Segment mang data hoặc FIN được lưu lại để chờ ACK
+ * (và retransmit); ACK thuần thì gửi rồi bỏ.
+ * flags ở host order.
+ */
+static int _segment_send(ctcp_state_t *state, uint32_t flags, const void *data, size_t len)
+{
+  ctcp_segment_t *seg = _segment_create(state, flags, data, len);
+  size_t seg_len = SEGMENT_HDR_SIZE + len;
+
+  send_segment_t *entry = calloc(1, sizeof(send_segment_t));
+  if (entry == NULL){
+    free(seg);
+    return -1;
   }
 
-  free(seg);
+  int r = conn_send(state->conn, seg, seg_len);
+  if (r == -1){
+    perr("segment send fail");
+    free(seg);  
+    free(entry);  
+    return -1;
+  }
+  // Quản lý gói tin và đưa vào
+  if (len > 0 || (flags & FIN)){ 
+    // Không cần cấp phát data của segment cho entry vì đã cấp phát trong lúc tạo segment 
+    uint32_t consumed = (uint32_t)len + ((flags & FIN) ? 1 : 0);
+
+    entry->segment = seg;
+    entry->len = seg_len;
+    entry->start_seq = state->seqno;
+    entry->end_seq = state->seqno + consumed;
+    entry->rext_count = 0;
+    entry->sent_time = current_time();
+    ll_add(state->send_queue, entry);
+    state->seqno += consumed;
+  } else {
+    // Đây là gói tin ACK 
+    free(seg);
+  }
+
   return (r < 0) ? -1 : 0;
 }
 
@@ -140,6 +177,22 @@ static void _send_ack(ctcp_state_t *state)
 {
   if (_segment_send(state, ACK, NULL, 0) < 0)
     perr("cannot send ACK");
+}
+
+static void _process_ack(ctcp_state_t *state, uint32_t ackno)
+{
+  // 1. Kiểm tra ACK hợp lệ.
+  // 2. Loại những segment đã được cumulative ACK.
+  // 3. Giải phóng bộ nhớ của từng segment.
+  // 4. Cập nhật send_base.
+  // 5. Cho phép gửi dữ liệu mới khi window mở ra.
+}
+
+static size_t _send_window_available(ctcp_state_t *state){
+  uint32_t in_flight = state->seqno - state->send_base;
+  size_t window = state->cfg->send_window;
+  if (in_flight >= window) return 0;
+  return window - in_flight;
 }
 
 ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg)
@@ -161,9 +214,8 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg)
   state->cfg = cfg;
   state->seqno = 1;
   state->ackno = 1;
-  state->unacked = NULL;
-  state->pending_len = 0;
-  state->pending_off = 0;
+  state->send_base = 1;
+  state->send_queue = ll_create();
   state->fin_sent = false;
   state->fin_received = false;
   return state;
@@ -176,7 +228,7 @@ void ctcp_destroy(ctcp_state_t *state)
   *state->prev = state->next;
   conn_remove(state->conn);
 
-  free(state->unacked);
+  ll_destroy(state->send_queue);
   free(state->cfg);
   free(state);
   end_client();
@@ -184,20 +236,32 @@ void ctcp_destroy(ctcp_state_t *state)
 
 void ctcp_read(ctcp_state_t *state)
 {
-  /* Stop-and-wait: chỉ đọc/gửi tiếp khi không còn segment nào chờ ACK. */
-  if (state->fin_sent || state->unacked != NULL)
+  /* Stop-and-wait: chỉ đọc/gửi tiếp khi không còn segment nào chờ ACK. 
+  *  Update: sliding windows: Kiểm tra kích thước data, tạo và xử lý segment hợp lý.
+  */
+  if (state->fin_sent)
     return;
 
-  char buf[MAX_SEG_DATA_SIZE];
-  size_t max_len = sizeof(buf);
-  if (state->cfg->send_window > 0 && state->cfg->send_window < max_len)
-    max_len = state->cfg->send_window;
-
+  size_t max_len = _send_window_available(state);
+  if (max_len == 0) return;
+  char buf[max_len];
+  size_t offset = 0;
+  // n is byte read
   int n = conn_input(state->conn, buf, max_len);
   if (n > 0)
   {
-    if (_segment_send(state, ACK, buf, (size_t)n) < 0)
-      perr("cannot send data segment");
+    // Split data into multiple segment
+    while (offset < n){
+      if ((n - offset) > MAX_SEG_DATA_SIZE){
+        if (_segment_send(state, ACK, buf + offset, (size_t)MAX_SEG_DATA_SIZE) < 0)
+        perr("cannot send data segment");
+        offset += MAX_SEG_DATA_SIZE;
+      } else {
+        if (_segment_send(state, ACK, buf + offset, (size_t)n - offset) < 0)
+        perr("cannot send data segment");
+        offset = n;
+      }
+    }
   }
   else if (n < 0)
   {
@@ -213,7 +277,7 @@ static void _handle_data(ctcp_state_t *state, ctcp_segment_t *segment, size_t da
 {
   if (data_len > MAX_SEG_DATA_SIZE)
     return;
-
+  _process_ack(state, segment->ackno);
   if (segment->seqno == state->ackno)
   {
     /* Đúng thứ tự. Nếu đang còn dữ liệu chờ output thì bỏ qua (không ACK),
@@ -265,14 +329,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
   size_t data_len = segment->len - SEGMENT_HDR_SIZE;
 
   /* 1. Xử lý ACK cho segment đang chờ */
-  if ((segment->flags & ACK) && state->unacked != NULL &&
-      segment->ackno >= state->unacked_end)
-  {
-    free(state->unacked);
-    state->unacked = NULL;
-    state->unacked_len = 0;
-    state->retx_count = 0;
-  }
+  _process_ack(state, segment->ackno);
 
   /* 2. Xử lý data / FIN */
   if (data_len > 0)
@@ -283,12 +340,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
   free(segment);
 
   /* 3. Kiểm tra điều kiện đóng kết nối */
-  if (state->fin_sent && state->fin_received && state->unacked == NULL &&
-      state->pending_len == 0)
-  {
-    ctcp_destroy(state);
-    return;
-  }
+  
 
   /* 4. Có thể đã ACK xong, đọc tiếp input nếu có */
   ctcp_read(state);
@@ -330,21 +382,30 @@ void ctcp_timer()
   {
     ctcp_state_t *next_state = state->next; /* state có thể bị destroy */
 
-    if (state->unacked != NULL &&
-        now - state->sent_time >= state->cfg->rt_timeout)
+    // Lấy thông tin segment chưa ack trong queue để kiểm tra và gửi lại
+    linked_list_t *queue = state->send_queue;
+    ll_node_t *node = ll_front(queue);
+    while (node != NULL)
     {
-      if (state->retx_count >= MAX_RETRANSMIT)
+      send_segment_t *entry = (send_segment_t *)node->object;
+      if (now - entry->sent_time > state->cfg->rt_timeout)
       {
-        perr("peer unresponsive, tearing down");
-        ctcp_destroy(state);
+        if (entry->rext_count >= MAX_RETRANSMIT)
+        {
+          perr("Peer unresponsive, tearing down");
+          ctcp_destroy(state);
+          break;
+        }
+        else
+        {
+          if (conn_send(state->conn, entry->segment, entry->len) < 0){
+            perr("retransmit failed");
+          }
+          entry->sent_time = current_time();
+          entry->rext_count++;
+        }
       }
-      else
-      {
-        if (conn_send(state->conn, state->unacked, state->unacked_len) < 0)
-          perr("retransmit failed");
-        state->retx_count++;
-        state->sent_time = now;
-      }
+      node = node->next;
     }
     state = next_state;
   }
